@@ -173,68 +173,66 @@ def GetNodeDisk(node, ctxt=""):
     else:
         minions = [node]
 
-    columes = 'NAME,KNAME,FSTYPE,MOUNTPOINT,UUID,PARTUUID,MODEL,SIZE,TYPE,' \
-              'PKNAME,VENDOR'
-    keys = columes.split(',')
-    lsblk = ("lsblk --all --bytes --noheadings --output='%s' --path --raw" %
-             columes)
-    out = local.cmd(minions, 'cmd.run', [lsblk], expr_form='list')
-
-    minion_dev_info = {}
-    for minion in minions:
-        lsblk_out = out.get(minion)
-
-        if not lsblk_out:
-            minion_dev_info[minion] = {}
-            continue
-
-        devlist = map(lambda line: dict(zip(keys, line.split(' '))),
-                      lsblk_out.splitlines())
-
-        parents = set([d['PKNAME'] for d in devlist])
-
-        dev_info = {}
-        for d in devlist:
-            in_use = True
-
-            if d['TYPE'] == 'disk':
-                if d['KNAME'] in parents:
-                    # skip it
-                    continue
-                else:
-                    in_use = False
-            elif not d['FSTYPE']:
-                in_use = False
-
-            d.update({'INUSE': in_use})
-            dev_info.update({d['KNAME']: d})
-
-        minion_dev_info[minion] = dev_info
+    diskList = local.cmd(minions, 'grains.item', ['disks'])
 
     rv = {}
-    for node, ddict in minion_dev_info.iteritems():
-        rv[node] = []
-        for disk in ddict.values():
-            try:
-                u = list(bytearray(uuid.UUID(disk["UUID"]).get_bytes()))
-            except ValueError:
-                # TODO: log the error
-                u = [0] * 16
-            ssdStat = isSSD(node, disk['KNAME'])
-            rv[node].append({"DevName": disk["KNAME"],
-                              "FSType": disk["FSTYPE"],
-                              "FSUUID": u,
-                              "Model": disk["MODEL"],
-                              "MountPoint": [disk["MOUNTPOINT"]],
-                              "Name": disk["NAME"],
-                              "Parent": disk["PKNAME"],
-                              "Size": long(disk["SIZE"]),
-                              "Type": disk["TYPE"],
-                              "Used": disk["INUSE"],
-                              "SSD": ssdStat,
-                              "Vendor": disk.get("VENDOR", ""),
-                              "StorageProfile": "",
-                              "DiskId":u})
+
+    for minion in minions:
+        diskList_minion = diskList[minion]['disks']
+
+        for disk in diskList_minion:
+
+            disk_out = local.cmd(minion, 'partition.list', ['/dev/' + disk])
+            isSSD_out= local.cmd('rhcs1', 'grains.item', ['SSDs'])
+            isSSD = disk in isSSD_out
+
+            rv[minion].append({"DevName": disk_out.get(minion).get('info').get('disk'),
+                                "FSType": "", # disks have no FS
+                                "FSUUID": [0] * 16, # disks have no FS
+                                "Model": disk_out.get(minion).get('info').get('model'),
+                                "MountPoint": "",
+                                "Name": disk_out.get(minion).get('info').get('disk'),
+                                "Parent": "",
+                                "Size": disk_out.get(minion).get('info').get('size'),
+                                "Type": "disk",
+                                "Used": (not disk_out.get(minion)['partitions']), # Not in use if there are no partitions
+                                "SSD": isSSD,
+                                "Vendor": "",
+                                "StorageProfile": "",
+                                "DiskId": [0] * 16, # disks have no FSUUID
+                                })
+
+            for partition in disk_out.get(minion).get('partitions'):
+                
+                partition_out = local.cmd(minion, 'disk.blkid', ['/dev/' + disk + partition])
+                mount_out = local.cmd('rhcs1', 'mount.active').get(minion)
+                mountpoint = ""
+
+                in_use = True
+                if disk_out.get(minion)['partitions'][partition]['type'] == '':
+                    in_use = False
+
+                for mount in mount_out:
+                    if partition in mount_out.get(mount).get('device'):
+                        mountpoint = mount
+
+
+                rv.get(minion).append({"DevName": disk_out.get(minion).get('info').get('disk') + partition,
+                                        "FSType": disk_out.get(minion).get('partitions').get(partition).get('type'),
+                                        "FSUUID": partition_out.get(minion).get('/dev/' + disk + partition).get('UUID'),
+                                        "Model": "", # FS has no Model - use the parent model?
+                                        "MountPoint": mountpoint,
+                                        "Name": disk_out.get(minion).get('info').get('disk') + partition,
+                                        "Parent": disk_out.get(minion).get('info').get('disk'),
+                                        "Size": disk_out.get(minion).get('partitions').get(partition).get('size'),
+                                        "Type": "part",
+                                        "Used": in_use,
+                                        "SSD": isSSD,
+                                        "Vendor": "", # FS has no Vendor - use the parent model?
+                                        "StorageProfile": "",
+                                        "DiskId": partition_out.get(minion).get('/dev/' + disk + partition).get('UUID')
+                                        })
+
     return rv
 
 def GetNodeCpu(node, ctxt=""):
@@ -320,20 +318,14 @@ def GetNodeMemory(node, ctxt=""):
     else:
         minions = [node]
 
-    vmstat = ("cat /proc/meminfo")
-    out = local.cmd(minions, 'cmd.run', [vmstat], expr_form='list')
+    out = local.cmd(minions, 'status.meminfo')
 
     memoinfo = {}
     for minion in minions:
-        info = out.get(minion)
-        if info:
-            info_list = info.split('\n')
-            memoinfo[minion] = {'TotalSize': info_list[0].split(':')[1].strip(),
-                                'SwapTotal': info_list[14].split(':')[1].strip(),
-                                'Active': info_list[6].split(':')[1].strip(),
-                                'Type': ''}
-        else:
-            memoinfo[minion] = {'TotalSize': '', 'SwapTotal': '', 'Active': '', 'Type': ''}
+        memoinfo[minion] = {'TotalSize': out[minion]['MemTotal']['value'],
+                            'SwapTotal': out[minion]['SwapTotal']['value'],
+                            'Active': out[minion]['Active']['value'],
+                            'Type': ''}
 
     return memoinfo
 
@@ -428,7 +420,7 @@ def AddMonitoringPlugin(plugin_list, nodes, master=None, configs=None, ctxt=""):
         for plugin_name, config in configs.iteritems():
             if config["Enable"] == "false":
                 nodesInFailure = DisableMonitoringPlugin(nodes, plugin_name)
-		if nodesInFailure:
+        if nodesInFailure:
                     retVal[plugin_name] = nodesInFailure
         return retVal
     else:
@@ -505,21 +497,6 @@ def EnableMonitoringPlugin(nodes, pluginName, ctxt=""):
             log.error("%s-Failed to restart collectd on node %s after enabling the plugin %s" %(ctxt, node, pluginName))
             failed_minions[node] = "Failed to restart collectd"
     return failed_minions
-
-
-def isSSD(node, device, ctxt=""):
-    cmd = 'cat /sys/block/%s/queue/rotational' % device.split("/")[-1]
-    out = local.cmd('%s' % node, 'cmd.run', [cmd], expr_form='list').get(node, '').strip()
-    if not out:
-        log.error("%s-Failed to get cluster statistics from %s" % (ctxt, node))
-        raise Exception("Failed to get cluster statistics from %s" % node)
-    if out == '0':
-        return True
-    if out == '1':
-        return False
-    # Rotational attribute not found for this device which is not either SSD or HD
-    return False
-
 
 def RemoveMonitoringPlugin(nodes, pluginName, ctxt=""):
     failed_minions = {}
